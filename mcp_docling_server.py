@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
+import urllib.parse
+import urllib.request
 import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -26,7 +29,12 @@ from fastmcp import FastMCP, Context
 import litellm
 
 from chunker import chunk_document
-from config import EXTRACT_IMAGES, EXTRACT_TABLE_IMAGES, SUMMARIZATION_MODEL
+from config import (
+    EXTRACT_IMAGES,
+    EXTRACT_TABLE_IMAGES,
+    MAX_PDF_DOWNLOAD_BYTES,
+    SUMMARIZATION_MODEL,
+)
 from embeddings import embed_query, embed_texts
 from metadata import extract_metadata, generate_paper_id
 from object_store import ObjectStore
@@ -95,6 +103,57 @@ def _validate_pdf_path(pdf_path: str) -> str | None:
     return None
 
 
+def _is_public_pdf_url(value: str) -> bool:
+    """Return True if *value* looks like an HTTP(S) URL."""
+    parsed = urllib.parse.urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _download_public_pdf(url: str) -> str:
+    """Download a public PDF URL to a temporary local file and return its path."""
+    with urllib.request.urlopen(url, timeout=30) as response:
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "pdf" not in content_type and not url.lower().endswith(".pdf"):
+            raise ValueError(
+                "URL does not appear to be a PDF (expected .pdf or Content-Type: application/pdf)."
+            )
+
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            expected_bytes = int(content_length)
+            if expected_bytes > MAX_PDF_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"PDF is too large ({expected_bytes} bytes). "
+                    f"Maximum allowed is {MAX_PDF_DOWNLOAD_BYTES} bytes."
+                )
+
+        temp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", suffix=".pdf", prefix="pdf_parser_", delete=False
+            ) as tmp:
+                temp_path = tmp.name
+                total_downloaded = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total_downloaded += len(chunk)
+                    if total_downloaded > MAX_PDF_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"PDF is too large (> {MAX_PDF_DOWNLOAD_BYTES} bytes)."
+                        )
+                    tmp.write(chunk)
+                return tmp.name
+        except Exception:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+            raise
+
+
 def _services_ready() -> str | None:
     """Returns an error string if any backend hasn't started yet."""
     if _converter is None:
@@ -140,8 +199,19 @@ def _ensure_indexed(source: str) -> str:
         summary = _index_paper_sync(source)
         return summary["paper_id"]
 
+    if _is_public_pdf_url(source):
+        temp_path = _download_public_pdf(source)
+        try:
+            summary = _index_paper_sync(temp_path)
+            return summary["paper_id"]
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
     raise ValueError(
-        f"No indexed paper matches '{source}' and it is not a valid PDF path."
+        f"No indexed paper matches '{source}' and it is not a valid PDF path/URL."
     )
 
 def _index_paper_sync(pdf_path: str) -> dict[str, Any]:
@@ -233,18 +303,40 @@ async def index_paper(pdf_path: str, ctx: Context) -> str:
     automatically.
 
     Args:
-        pdf_path: Absolute path to the PDF on disk.
+        pdf_path: Absolute local PDF path, or a public HTTP(S) URL to a PDF.
     """
-    err = _validate_pdf_path(pdf_path) or _services_ready()
+    err = _services_ready()
     if err:
         return err
 
-    await ctx.info(f"Indexing paper: {pdf_path}")
+    source = pdf_path.strip()
+    local_pdf = source
+    cleanup_path: str | None = None
+
+    if _is_public_pdf_url(source):
+        await ctx.info(f"Downloading PDF from URL: {source}")
+        try:
+            local_pdf = await asyncio.to_thread(_download_public_pdf, source)
+            cleanup_path = local_pdf
+        except Exception as exc:
+            return f"Error downloading PDF URL: {exc}"
+    else:
+        err = _validate_pdf_path(source)
+        if err:
+            return err
+
+    await ctx.info(f"Indexing paper: {source}")
 
     try:
-        summary = await asyncio.to_thread(_index_paper_sync, pdf_path.strip())
+        summary = await asyncio.to_thread(_index_paper_sync, local_pdf)
     except Exception as exc:
         return f"Error during indexing: {exc}"
+    finally:
+        if cleanup_path:
+            try:
+                os.unlink(cleanup_path)
+            except OSError:
+                pass
 
     if summary["status"] == "already_indexed":
         return (

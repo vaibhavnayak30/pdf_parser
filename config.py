@@ -38,3 +38,8 @@ EXTRACT_TABLE_IMAGES: bool = (
 )
 
 _METADATA_MODEL: str = os.getenv("METADATA_MODEL", "gpt-4o-mini")
+
+# Remote PDF ingestion
+MAX_PDF_DOWNLOAD_BYTES: int = int(
+    os.getenv("MAX_PDF_DOWNLOAD_BYTES", str(100 * 1024 * 1024))
+)

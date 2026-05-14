@@ -1,20 +1,31 @@
 """
-Qdrant vector store — collection setup, chunk indexing, and semantic search.
+Qdrant vector store — collection setup, chunk indexing, and hybrid search.
+
+Uses named vectors ("dense" + "sparse") with Reciprocal Rank Fusion (RRF)
+to combine semantic similarity with keyword-level matching at query time.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
+from fastembed import SparseEmbedding
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    Fusion,
+    FusionQuery,
     MatchAny,
     MatchValue,
     PayloadSchemaType,
     PointStruct,
+    Prefetch,
+    SparseIndexParams,
+    SparseVector,
+    SparseVectorParams,
     TextIndexParams,
     TextIndexType,
     TokenizerType,
@@ -22,6 +33,11 @@ from qdrant_client.models import (
 )
 
 from config import EMBEDDING_DIMENSION, QDRANT_COLLECTION, QDRANT_URL
+
+logger = logging.getLogger(__name__)
+
+_DENSE_VECTOR_NAME = "dense"
+_SPARSE_VECTOR_NAME = "sparse"
 
 
 class VectorStore:
@@ -38,18 +54,49 @@ class VectorStore:
         self.dimension = dimension
         self._ensure_collection()
 
+    # ------------------------------------------------------------------
+    # Collection lifecycle
+    # ------------------------------------------------------------------
+
     def _ensure_collection(self) -> None:
         names = [c.name for c in self.client.get_collections().collections]
-        if self.collection in names:
-            return
 
+        if self.collection in names:
+            if self._has_hybrid_schema():
+                logger.info("Qdrant collection '%s' ready.", self.collection)
+                return
+            logger.warning(
+                "Collection '%s' lacks hybrid vector schema — recreating. "
+                "You will need to re-index all papers.",
+                self.collection,
+            )
+            self.client.delete_collection(collection_name=self.collection)
+
+        logger.info("Creating Qdrant collection '%s'.", self.collection)
         self.client.create_collection(
             collection_name=self.collection,
-            vectors_config=VectorParams(
-                size=self.dimension, distance=Distance.COSINE
-            ),
+            vectors_config={
+                _DENSE_VECTOR_NAME: VectorParams(
+                    size=self.dimension, distance=Distance.COSINE
+                ),
+            },
+            sparse_vectors_config={
+                _SPARSE_VECTOR_NAME: SparseVectorParams(
+                    index=SparseIndexParams(on_disk=False),
+                ),
+            },
         )
         self._create_payload_indexes()
+
+    def _has_hybrid_schema(self) -> bool:
+        """Return True if the collection already has both named vectors."""
+        info = self.client.get_collection(collection_name=self.collection)
+        vectors_cfg = info.config.params.vectors or {}
+        sparse_cfg = info.config.params.sparse_vectors or {}
+        return (
+            _DENSE_VECTOR_NAME in vectors_cfg
+            and _SPARSE_VECTOR_NAME in sparse_cfg
+        )
 
     def _create_payload_indexes(self) -> None:
         keyword_fields = ["paper_id", "authors", "section_name", "source_filename"]
@@ -78,24 +125,37 @@ class VectorStore:
             field_schema=PayloadSchemaType.INTEGER,
         )
 
-    # Indexing chunks
+    # ------------------------------------------------------------------
+    # Indexing
+    # ------------------------------------------------------------------
+
     def index_chunks(
         self,
         paper_id: str,
         chunks: list[dict[str, Any]],
-        embeddings: list[list[float]],
+        dense_embeddings: list[list[float]],
+        sparse_embeddings: list[SparseEmbedding],
         meta: dict[str, Any],
     ) -> int:
-        """Upsert embedded chunks. Returns how many points were stored."""
+        """Upsert embedded chunks with both dense and sparse vectors.
+        Returns how many points were stored."""
         points: list[PointStruct] = []
-        for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
+        for i, (chunk, dense_vec, sparse_emb) in enumerate(
+            zip(chunks, dense_embeddings, sparse_embeddings)
+        ):
             point_id = str(
                 uuid.uuid5(uuid.NAMESPACE_DNS, f"{paper_id}_{i}")
             )
             points.append(
                 PointStruct(
                     id=point_id,
-                    vector=vector,
+                    vector={
+                        _DENSE_VECTOR_NAME: dense_vec,
+                        _SPARSE_VECTOR_NAME: SparseVector(
+                            indices=sparse_emb.indices.tolist(),
+                            values=sparse_emb.values.tolist(),
+                        ),
+                    },
                     payload={
                         "paper_id": paper_id,
                         "title": meta.get("title", ""),
@@ -117,12 +177,19 @@ class VectorStore:
                 collection_name=self.collection,
                 points=points[start : start + batch_size],
             )
+        logger.info(
+            "Stored %d chunks for paper %s in Qdrant.", len(points), paper_id
+        )
         return len(points)
 
-    # Search chunks
+    # ------------------------------------------------------------------
+    # Hybrid search
+    # ------------------------------------------------------------------
+
     def search(
         self,
         query_vector: list[float],
+        query_sparse: SparseEmbedding,
         limit: int = 5,
         paper_id: str | None = None,
         author: str | None = None,
@@ -148,15 +215,39 @@ class VectorStore:
             )
 
         query_filter = Filter(must=conditions) if conditions else None
+        logger.debug(
+            "Hybrid search: limit=%d, filters=%s",
+            limit,
+            [c.key for c in conditions] if conditions else "none",
+        )
+
+        prefetch_limit = max(limit * 4, 20)
 
         hits = self.client.query_points(
             collection_name=self.collection,
-            query=query_vector,
-            query_filter=query_filter,
+            prefetch=[
+                Prefetch(
+                    query=SparseVector(
+                        indices=query_sparse.indices.tolist(),
+                        values=query_sparse.values.tolist(),
+                    ),
+                    using=_SPARSE_VECTOR_NAME,
+                    limit=prefetch_limit,
+                    filter=query_filter,
+                ),
+                Prefetch(
+                    query=query_vector,
+                    using=_DENSE_VECTOR_NAME,
+                    limit=prefetch_limit,
+                    filter=query_filter,
+                ),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
             limit=limit,
             with_payload=True,
         )
 
+        logger.info("Hybrid search returned %d results.", len(hits.points))
         return [
             {
                 "score": hit.score,

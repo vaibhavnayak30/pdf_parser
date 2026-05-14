@@ -1,5 +1,6 @@
 docling>=2.31.0
 docling-core[chunking-openai]
+fastembed>=0.4.0
 fastmcp>=2.0.0
 litellm>=1.30.0
 minio>=7.2.0

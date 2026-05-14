@@ -10,7 +10,7 @@ from docling.chunking import HybridChunker
 from docling_core.transforms.chunker import DocChunk
 from docling_core.transforms.chunker.tokenizer.openai import OpenAITokenizer
 
-from config import CHUNK_MAX_TOKENS, SKIP_REFERENCE_SECTIONS
+from config import CHUNK_MAX_TOKENS, CHUNK_TOKENIZER_MODEL, SKIP_REFERENCE_SECTIONS
 
 _REFERENCE_HEADINGS = frozenset(
     {"references", "bibliography", "works cited", "literature cited"}
@@ -19,7 +19,7 @@ _REFERENCE_HEADINGS = frozenset(
 _ABSTRACT_HEADINGS = frozenset({"abstract"})
 
 _tokenizer = OpenAITokenizer(
-    tokenizer=tiktoken.encoding_for_model("gpt-4o"),
+    tokenizer=tiktoken.encoding_for_model(CHUNK_TOKENIZER_MODEL),
     max_tokens=CHUNK_MAX_TOKENS,
 )
 
@@ -30,10 +30,21 @@ _chunker = HybridChunker(
 )
 
 
-def chunk_document(doc: Any) -> list[dict[str, Any]]:
+def chunk_document(
+    doc: Any,
+    title: str = "",
+    publication_year: str = "",
+) -> list[dict[str, Any]]:
     """Turn a DoclingDocument into a flat list of chunk dicts ready for
     embedding. Each dict has: text, enriched_text, section_name,
-    chunk_index, page_numbers, is_abstract."""
+    chunk_index, page_numbers, is_abstract.
+
+    ``title`` and ``publication_year`` are prepended to ``enriched_text``
+    so the embedding captures document-level context, but they are NOT
+    included in ``text`` (which is what the LLM sees as retrieved context).
+    """
+
+    doc_prefix = _build_doc_prefix(title, publication_year)
 
     raw_chunks: list[DocChunk] = list(_chunker.chunk(dl_doc=doc))
     results: list[dict[str, Any]] = []
@@ -47,7 +58,9 @@ def chunk_document(doc: Any) -> list[dict[str, Any]]:
 
         is_abstract = _is_abstract_section(headings)
         page_numbers = _extract_page_numbers(chunk)
-        enriched_text = _chunker.contextualize(chunk=chunk)
+
+        base_enriched = _chunker.contextualize(chunk=chunk)
+        enriched_text = f"{doc_prefix}{base_enriched}" if doc_prefix else base_enriched
 
         results.append(
             {
@@ -61,6 +74,19 @@ def chunk_document(doc: Any) -> list[dict[str, Any]]:
         )
 
     return results
+
+
+def _build_doc_prefix(title: str, publication_year: str) -> str:
+    """Build the document-level prefix prepended to each chunk's enriched
+    text for embedding.  Returns empty string if no metadata is available."""
+    parts: list[str] = []
+    if title:
+        parts.append(f"Title: {title}")
+    if publication_year:
+        parts.append(f"Year: {publication_year}")
+    if not parts:
+        return ""
+    return "\n".join(parts) + "\n---\n"
 
 
 def _is_reference_section(headings: list[str]) -> bool:
